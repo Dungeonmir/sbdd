@@ -19,82 +19,76 @@
 #include <linux/moduleparam.h>
 #include <linux/spinlock_types.h>
 
-#define SBDD_SECTOR_SHIFT       9
-#define SBDD_SECTOR_SIZE        (1 << SBDD_SECTOR_SHIFT)
-#define SBDD_MIB_SECTORS        (1 << (20 - SBDD_SECTOR_SHIFT))
-#define SBDD_NAME               "sbdd"
+#define SBDD_SECTOR_SHIFT 9
+#define SBDD_SECTOR_SIZE (1 << SBDD_SECTOR_SHIFT)
+#define SBDD_MIB_SECTORS (1 << (20 - SBDD_SECTOR_SHIFT))
+#define SBDD_NAME "sbdd"
 
-struct sbdd {
-	wait_queue_head_t       exitwait;
-	spinlock_t              datalock;
-	atomic_t                deleting;
-	atomic_t                refs_cnt;
-	sector_t                capacity;
-	u8                      *data;
-	struct gendisk          *gd;
+static char *drive_path = "/dev/nvme0n1";
+
+struct sbdd
+{
+    wait_queue_head_t exitwait;
+    spinlock_t datalock;
+    atomic_t deleting;
+    atomic_t refs_cnt;
+    sector_t capacity;
+    // u8 *data;
+    struct gendisk *gd;
+
+    struct bdev_handle *disk_handle;
 };
 
-static struct sbdd              __sbdd = { 0 };
-static unsigned long            __sbdd_capacity_mib = 100;
+static struct sbdd __sbdd = {0};
+static unsigned long __sbdd_capacity_mib = 100;
 
-static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
+static void sbdd_clone_endio(struct bio *clone)
 {
-	void *buff = kmap_atomic(bvec->bv_page) + bvec->bv_offset;
-	sector_t len = bvec->bv_len >> SBDD_SECTOR_SHIFT;
-	size_t offset;
-	size_t nbytes;
-
-	if (pos + len > __sbdd.capacity)
-		len = __sbdd.capacity - pos;
-
-	offset = pos << SBDD_SECTOR_SHIFT;
-	nbytes = len << SBDD_SECTOR_SHIFT;
-
-	spin_lock(&__sbdd.datalock);
-
-	if (dir)
-		memcpy(__sbdd.data + offset, buff, nbytes);
-	else
-		memcpy(buff, __sbdd.data + offset, nbytes);
-
-	spin_unlock(&__sbdd.datalock);
-
-	pr_debug("pos=%6llu len=%4llu %s\n", pos, len, dir ? "written" : "read");
-
-	kunmap_atomic(buff);
-	return len;
+    struct bio *orig = clone->bi_private;
+    if (clone->bi_status)
+    {
+        bio_io_error(orig);
+    }
+    else
+    {
+        bio_endio(orig); // if clone completed succesfully then orig can be endio
+    }
+    bio_put(clone); // explicit dereference bc i cloned bio
 }
-
 static void sbdd_submit_bio(struct bio *bio)
 {
-	struct bvec_iter iter;
-	struct bio_vec bvec;
-	int dir;
-	sector_t pos;
 
-	bio = bio_split_to_limits(bio);
-	if (!bio)
-		return;
+    bio = bio_split_to_limits(bio);
+    if (!bio)
+        return;
 
-	if (atomic_read(&__sbdd.deleting)) {
-		bio_io_error(bio);
-		return;
-	}
+    // https://elixir.bootlin.com/linux/v6.8.12/source/include/linux/gfp_types.h#L16
+    //  GFP - flags how to allocate memory
+    struct bio *clone = bio_alloc_clone(__sbdd.disk_handle->bdev, bio, GFP_KERNEL, &fs_bio_set);
+    if (!clone)
+    {
+        pr_err("cannot clone bio\n");
+        bio_io_error(bio);
+        return;
+    }
+    if (atomic_read(&__sbdd.deleting))
+    {
+        bio_io_error(bio);
+        return;
+    }
 
-	if (!atomic_inc_not_zero(&__sbdd.refs_cnt)) {
-		bio_io_error(bio);
-		return;
-	}
+    if (!atomic_inc_not_zero(&__sbdd.refs_cnt))
+    {
+        bio_io_error(bio);
+        return;
+    }
 
-	dir = bio_data_dir(bio);
-	pos = bio->bi_iter.bi_sector;
-	bio_for_each_segment(bvec, bio, iter)
-		pos += sbdd_xfer(&bvec, pos, dir);
+    clone->bi_end_io = sbdd_clone_endio; // setting up callback
+    clone->bi_private = bio;             // saving original bio for future use in endio
+    submit_bio(clone);
 
-	bio_endio(bio);
-
-	if (atomic_dec_and_test(&__sbdd.refs_cnt))
-		wake_up(&__sbdd.exitwait);
+    if (atomic_dec_and_test(&__sbdd.refs_cnt))
+        wake_up(&__sbdd.exitwait);
 }
 
 /*
@@ -102,75 +96,94 @@ There are no read or write operations. These operations are performed by
 the request() function associated with the request queue of the disk.
 */
 static struct block_device_operations const __sbdd_bdev_ops = {
-	.owner = THIS_MODULE,
-	.submit_bio = sbdd_submit_bio,
+    .owner = THIS_MODULE,
+    .submit_bio = sbdd_submit_bio,
 };
 
 static int sbdd_create(void)
 {
-	int ret = 0;
+    int ret = 0;
 
-	pr_info("allocating data\n");
-	__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
-	__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
-	if (!__sbdd.data) {
-		pr_err("unable to alloc data\n");
-		return -ENOMEM;
-	}
+    blk_mode_t drive_mode = BLK_OPEN_WRITE | BLK_OPEN_READ;
 
-	spin_lock_init(&__sbdd.datalock);
-	init_waitqueue_head(&__sbdd.exitwait);
+    dev_t dev;
+    int bdev = lookup_bdev(drive_path, &dev);
+    if (bdev)
+    {
+        pr_err("Invalid drive path %s\n", drive_path);
+        return -1;
+    }
+    pr_info("disk %s dev: %u\n", drive_path, dev);
+    __sbdd.disk_handle = bdev_open_by_path(drive_path, drive_mode, NULL, NULL);
+    if (IS_ERR(__sbdd.disk_handle))
+    {
+        pr_err("Failed to open %s\n", drive_path);
+        return -1;
+    }
 
-	pr_info("allocating disk\n");
-	__sbdd.gd = blk_alloc_disk(NUMA_NO_NODE);
-	if (IS_ERR(__sbdd.gd)) {
-		pr_err("blk_alloc_disk() failed\n");
-		ret = PTR_ERR(__sbdd.gd);
-		__sbdd.gd = NULL;
-		return ret;
-	}
+    sector_t capacity = get_capacity(__sbdd.disk_handle->bdev->bd_disk);
+    pr_info("disk %s has %llu sectors\n", drive_path, capacity);
+    pr_info("disk %s has %llu MiB\n", drive_path, capacity / SBDD_MIB_SECTORS);
 
-	/* Configure queue */
-	blk_queue_logical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
-	blk_queue_physical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
+    pr_info("setting up capacity \n");
+    __sbdd.capacity = capacity;
 
-	/* Configure gendisk */
-	__sbdd.gd->fops = &__sbdd_bdev_ops;
-	__sbdd.gd->private_data = &__sbdd;
-	scnprintf(__sbdd.gd->disk_name, DISK_NAME_LEN, SBDD_NAME);
-	set_capacity(__sbdd.gd, __sbdd.capacity);
-	atomic_set(&__sbdd.refs_cnt, 1);
+    spin_lock_init(&__sbdd.datalock);
+    init_waitqueue_head(&__sbdd.exitwait);
 
-	/*
-	Allocating gd does not make it available, add_disk() is required.
-	After this call, gd methods can be called at any time. Should not be
-	called before the driver is fully initialized and ready to process reqs.
-	*/
-	pr_info("adding disk\n");
-	ret = add_disk(__sbdd.gd);
-	if (ret)
-		pr_err("add_disk() failed\n");
+    pr_info("allocating gendisk struct\n");
+    __sbdd.gd = blk_alloc_disk(NUMA_NO_NODE);
+    if (IS_ERR(__sbdd.gd))
+    {
+        pr_err("blk_alloc_disk() failed\n");
+        ret = PTR_ERR(__sbdd.gd);
+        __sbdd.gd = NULL;
+        return ret;
+    }
 
-	return ret;
+    /* Configure queue */
+    blk_queue_logical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
+    blk_queue_physical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
+
+    /* Configure gendisk */
+    __sbdd.gd->fops = &__sbdd_bdev_ops;
+    __sbdd.gd->private_data = &__sbdd;
+    scnprintf(__sbdd.gd->disk_name, DISK_NAME_LEN, SBDD_NAME);
+    set_capacity(__sbdd.gd, __sbdd.capacity);
+    atomic_set(&__sbdd.refs_cnt, 1);
+
+    /*
+    Allocating gd does not make it available, add_disk() is required.
+    After this call, gd methods can be called at any time. Should not be
+    called before the driver is fully initialized and ready to process reqs.
+    */
+    pr_info("adding disk %s\n", SBDD_NAME);
+    ret = add_disk(__sbdd.gd);
+    if (ret)
+        pr_err("add_disk() failed\n");
+
+    return ret;
 }
 
 static void sbdd_delete(void)
 {
-	atomic_set(&__sbdd.deleting, 1);
-	atomic_dec_if_positive(&__sbdd.refs_cnt);
-	wait_event(__sbdd.exitwait, !atomic_read(&__sbdd.refs_cnt));
+    atomic_set(&__sbdd.deleting, 1);
+    atomic_dec_if_positive(&__sbdd.refs_cnt);
+    wait_event(__sbdd.exitwait, !atomic_read(&__sbdd.refs_cnt));
 
-	/* gd will be removed only after the last reference put */
-	if (__sbdd.gd) {
-		pr_info("deleting disk\n");
-		del_gendisk(__sbdd.gd);
-		put_disk(__sbdd.gd);
-	}
+    /* gd will be removed only after the last reference put */
+    if (__sbdd.gd)
+    {
+        pr_info("deleting disk\n");
+        del_gendisk(__sbdd.gd);
+        put_disk(__sbdd.gd);
+    }
 
-	if (__sbdd.data) {
-		pr_info("freeing data\n");
-		vfree(__sbdd.data);
-	}
+    if (__sbdd.disk_handle)
+    {
+        pr_info("releasing handle \n");
+        bdev_release(__sbdd.disk_handle);
+    }
 }
 
 /*
@@ -180,19 +193,23 @@ There is also __initdata note, same but used for variables.
 */
 static int __init sbdd_init(void)
 {
-	int ret = 0;
+    pr_info("drive path: %s\n", drive_path);
+    int ret = 0;
 
-	pr_info("starting initialization...\n");
-	ret = sbdd_create();
+    pr_info("starting initialization...\n");
+    ret = sbdd_create();
 
-	if (ret) {
-		pr_err("initialization failed\n");
-		sbdd_delete();
-	} else {
-		pr_info("initialization complete\n");
-	}
+    if (ret)
+    {
+        pr_err("initialization failed\n");
+        sbdd_delete();
+    }
+    else
+    {
+        pr_info("initialization complete\n");
+    }
 
-	return ret;
+    return ret;
 }
 
 /*
@@ -202,9 +219,9 @@ directly into the kernel). There is also __exitdata note.
 */
 static void __exit sbdd_exit(void)
 {
-	pr_info("exiting...\n");
-	sbdd_delete();
-	pr_info("exiting complete\n");
+    pr_info("exiting...\n");
+    sbdd_delete();
+    pr_info("exiting complete\n");
 }
 
 /* Called on module loading. Is mandatory. */
@@ -215,6 +232,8 @@ module_exit(sbdd_exit);
 
 /* Set desired capacity with insmod */
 module_param_named(capacity_mib, __sbdd_capacity_mib, ulong, S_IRUGO);
+// Set the drive path to copy to
+module_param_named(drive_path, drive_path, charp, S_IRUGO);
 
 /* Note for the kernel: a free license module. A warning will be outputted without it. */
 MODULE_LICENSE("GPL");
