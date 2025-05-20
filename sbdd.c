@@ -29,18 +29,15 @@ static char *drive_path = "/dev/nvme0n1";
 struct sbdd
 {
     wait_queue_head_t exitwait;
-    spinlock_t datalock;
     atomic_t deleting;
     atomic_t refs_cnt;
     sector_t capacity;
-    // u8 *data;
     struct gendisk *gd;
 
     struct bdev_handle *disk_handle;
 };
 
 static struct sbdd __sbdd = {0};
-static unsigned long __sbdd_capacity_mib = 100;
 
 static void sbdd_clone_endio(struct bio *clone)
 {
@@ -51,20 +48,32 @@ static void sbdd_clone_endio(struct bio *clone)
     }
     else
     {
-        bio_endio(orig); // if clone completed succesfully then orig can be endio
+        /* if clone completed succesfully then i can call endio for orig */
+        bio_endio(orig);
     }
-    bio_put(clone); // explicit dereference bc i cloned bio
+    /*
+    explicit dereference bc i cloned bio
+    */
+    bio_put(clone);
+
+    /*
+    decrease amount of references after clone submit_bio
+    */
+    if (atomic_dec_and_test(&__sbdd.refs_cnt))
+        wake_up(&__sbdd.exitwait);
 }
 static void sbdd_submit_bio(struct bio *bio)
 {
-
+    struct bio *clone = NULL;
     bio = bio_split_to_limits(bio);
     if (!bio)
         return;
 
-    // https://elixir.bootlin.com/linux/v6.8.12/source/include/linux/gfp_types.h#L16
-    //  GFP - flags how to allocate memory
-    struct bio *clone = bio_alloc_clone(__sbdd.disk_handle->bdev, bio, GFP_KERNEL, &fs_bio_set);
+    /*
+    https://elixir.bootlin.com/linux/v6.8.12/source/include/linux/gfp_types.h#L16
+    GFP - flags how to allocate memory
+    */
+    clone = bio_alloc_clone(__sbdd.disk_handle->bdev, bio, GFP_KERNEL, &fs_bio_set);
     if (!clone)
     {
         pr_err("cannot clone bio\n");
@@ -74,21 +83,26 @@ static void sbdd_submit_bio(struct bio *bio)
     if (atomic_read(&__sbdd.deleting))
     {
         bio_io_error(bio);
+        bio_put(clone);
         return;
     }
 
     if (!atomic_inc_not_zero(&__sbdd.refs_cnt))
     {
         bio_io_error(bio);
+        bio_put(clone);
         return;
     }
 
-    clone->bi_end_io = sbdd_clone_endio; // setting up callback
-    clone->bi_private = bio;             // saving original bio for future use in endio
+    /*
+    setting up callback
+    */
+    clone->bi_end_io = sbdd_clone_endio;
+    /*
+    saving original bio for future use in endio
+    */
+    clone->bi_private = bio;
     submit_bio(clone);
-
-    if (atomic_dec_and_test(&__sbdd.refs_cnt))
-        wake_up(&__sbdd.exitwait);
 }
 
 /*
@@ -103,17 +117,9 @@ static struct block_device_operations const __sbdd_bdev_ops = {
 static int sbdd_create(void)
 {
     int ret = 0;
-
+    sector_t capacity = 0;
     blk_mode_t drive_mode = BLK_OPEN_WRITE | BLK_OPEN_READ;
 
-    dev_t dev;
-    int bdev = lookup_bdev(drive_path, &dev);
-    if (bdev)
-    {
-        pr_err("Invalid drive path %s\n", drive_path);
-        return -1;
-    }
-    pr_info("disk %s dev: %u\n", drive_path, dev);
     __sbdd.disk_handle = bdev_open_by_path(drive_path, drive_mode, NULL, NULL);
     if (IS_ERR(__sbdd.disk_handle))
     {
@@ -121,14 +127,13 @@ static int sbdd_create(void)
         return -1;
     }
 
-    sector_t capacity = get_capacity(__sbdd.disk_handle->bdev->bd_disk);
+    capacity = get_capacity(__sbdd.disk_handle->bdev->bd_disk);
     pr_info("disk %s has %llu sectors\n", drive_path, capacity);
     pr_info("disk %s has %llu MiB\n", drive_path, capacity / SBDD_MIB_SECTORS);
 
     pr_info("setting up capacity \n");
     __sbdd.capacity = capacity;
 
-    spin_lock_init(&__sbdd.datalock);
     init_waitqueue_head(&__sbdd.exitwait);
 
     pr_info("allocating gendisk struct\n");
@@ -230,9 +235,7 @@ module_init(sbdd_init);
 /* Called on module unloading. Unloading module is not allowed without it. */
 module_exit(sbdd_exit);
 
-/* Set desired capacity with insmod */
-module_param_named(capacity_mib, __sbdd_capacity_mib, ulong, S_IRUGO);
-// Set the drive path to copy to
+/* Set the drive path to copy to */
 module_param_named(drive_path, drive_path, charp, S_IRUGO);
 
 /* Note for the kernel: a free license module. A warning will be outputted without it. */
